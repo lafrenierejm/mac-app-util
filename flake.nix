@@ -120,6 +120,7 @@
               {
                 lispPackagesLite,
                 dockutil,
+                openssl,
                 findutils,
                 jq,
                 rsync,
@@ -143,6 +144,7 @@
                       with pkgs;
                       lib.makeBinPath [
                         dockutil
+                        openssl
                         rsync
                         findutils
                         jq

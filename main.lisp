@@ -258,6 +258,91 @@ Also resolves symlinks, if relevant.
               :replacing ,existing))))))
 
 
+;;; sign-copy
+
+(defun default-cert-name ()
+  "Default name of the signing certificate.
+
+Root and regular users get different names.  Root's certificate lives in the
+System keychain, which users can see too; with a shared name a user could pick
+up the system identity, whose private key they cannot use."
+  (if (rootp) "mac-app-util system signing" "mac-app-util user signing"))
+
+(defun find-identities (identity)
+  "Hashes of the code-signing identities named exactly IDENTITY, or whose SHA-1
+hash is IDENTITY.
+
+Deliberately without -v: a self-signed certificate that is not (yet) trusted is
+still an identity that exists."
+  (let ((out (uiop:run-program '("/usr/bin/security" "find-identity" "-p" "codesigning")
+                               :output :string
+                               :ignore-error-status t)))
+    (remove-duplicates
+     (loop for line in (str:lines out)
+           for words = (str:words line)
+           for q1 = (position #\" line)
+           for q2 = (and q1 (position #\" line :start (1+ q1)))
+           ;; Lines look like:  1) 6E55…EC "name" [(CSSMERR_TP_NOT_TRUSTED)]
+           when (and q2
+                     (>= (length words) 2)
+                     (str:ends-with-p ")" (first words))
+                     (or (string-equal (second words) identity)
+                         (string= (subseq line (1+ q1) q2) identity)))
+             collect (string-upcase (second words)))
+     :test #'string=)))
+
+(defun resolve-identity (identity)
+  "The hash of the single code-signing identity matching IDENTITY.
+
+Signing by hash avoids codesign's loose matching of names."
+  (let ((hashes (find-identities identity)))
+    (cond ((null hashes)
+           (error "No code-signing identity named ~S in the keychain (see `security find-identity -p codesigning`).  To create one, run: mac-app-util create-cert ~S" identity identity))
+          ((rest hashes)
+           (error "Several code-signing identities are named ~S: ~{~A~^, ~}.  Remove the extra ones, or use a hash as the identity." identity hashes))
+          (T (first hashes)))))
+
+(defun create-cert (&optional (name (default-cert-name)))
+  "Create a self-signed code-signing certificate and install it in the keychain.
+
+Needs a user at the screen: trusting the certificate asks for a password.  When
+run as root the System keychain is used, otherwise your login keychain."
+  (if (find-identities name)
+      (format T "Identity ~S already exists, nothing to do.~%" name)
+      (let* ((keychain (if (rootp)
+                           "/Library/Keychains/System.keychain"
+                           (format NIL "~A/Library/Keychains/login.keychain-db" (uiop:getenv "HOME"))))
+             (trust-args (when (rootp) '("-d"))))
+        (format T "Creating code-signing identity ~S in ~A; macOS will ask for a password to trust it.~%"
+                name keychain)
+        (in-temp-dir
+          ;; Never let the private key leave this temp dir and the keychain; in
+          ;; particular it must not end up in the Nix store.
+          (let ((pw (sh/ss '("openssl" "rand" "-hex" "16"))))
+            (sh `("openssl" "req" "-x509" "-newkey" "rsa:2048" "-nodes"
+                            "-keyout" "key.pem" "-out" "cert.pem" "-days" "3650"
+                            "-subj" ,(format NIL "/CN=~A" name)
+                            "-addext" "keyUsage=critical,digitalSignature"
+                            "-addext" "extendedKeyUsage=critical,codeSigning"))
+            ;; macOS cannot import the AES-based PKCS#12 that OpenSSL 3 writes
+            ;; by default ("MAC verification failed"); use the old algorithms.
+            (sh `("openssl" "pkcs12" "-export" "-inkey" "key.pem" "-in" "cert.pem"
+                            "-name" ,name "-out" "id.p12"
+                            "-certpbe" "PBE-SHA1-3DES" "-keypbe" "PBE-SHA1-3DES"
+                            "-macalg" "sha1" "-passout" ,(format NIL "pass:~A" pw)))
+            (sh `("/usr/bin/security" "import" "id.p12" "-k" ,keychain
+                                      "-P" ,pw "-T" "/usr/bin/codesign"))
+            (sh `("/usr/bin/security" "add-trusted-cert" ,@trust-args
+                                      "-r" "trustRoot" "-p" "codeSign"
+                                      "-k" ,keychain "cert.pem"))))
+        (format T "Created identity ~S in ~A.
+
+The first time codesign uses the key macOS may ask for permission; choose
+\"Always Allow\".  To avoid that prompt, run once:
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~A~%"
+                name keychain keychain))))
+
+
 ;;; sync-trampolines
 
 (defun symlinked-dir-p (d)
@@ -310,6 +395,7 @@ Also resolves symlinks, if relevant.
     mac-app-util mktrampoline FROM.app TO.app
     mac-app-util sync-dock Foo.app Bar.app ...
     mac-app-util sync-trampolines /my/nix/Applications /Applications/MyTrampolines/
+    mac-app-util create-cert [NAME]
 
 mktrampline creates a “trampoline” application launcher that immediately
 launches another application.
@@ -318,6 +404,11 @@ sync-dock updates persistent items in your dock if any of the given apps has the
 same name. This can be used to programmatically keep pinned items in your dock
 up to date with potential new versions of an app outside of the /Applications
 directory, without having to check which one is pinned etc.
+
+create-cert creates a self-signed code-signing certificate and installs it in the
+keychain: your login keychain, or the System keychain when run as root.  Default
+name: \"mac-app-util user signing\", or \"mac-app-util system signing\" as root.
+Trusting the certificate asks for a password.
 
 sync-trampolines is an all-in-1 solution that syncs an entire directory of *.app
 files to another by creating a trampoline launcher for every app, deleting the
@@ -337,6 +428,10 @@ rest, and updating the dock.
            (sync-dock apps))
           ((list "sync-trampolines" from to)
            (sync-trampolines from to))
+          ((list "create-cert")
+           (create-cert))
+          ((list "create-cert" name)
+           (create-cert name))
           (_
            (print-usage)
            (uiop:quit 1))))))
