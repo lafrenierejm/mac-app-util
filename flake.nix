@@ -47,6 +47,9 @@
           config,
           ...
         }:
+        let
+          cfg = config.targets.darwin.mac-app-util;
+        in
         {
           options = with lib; {
             targets.darwin.mac-app-util.enable = mkOption {
@@ -55,8 +58,32 @@
               example = true;
               description = "Whether to enable mac-app-util home manager integration";
             };
+            targets.darwin.mac-app-util.signingIdentity = mkOption {
+              type = types.str;
+              default = "mac-app-util user signing";
+              example = "My Code Signing Certificate";
+              description = ''
+                Name or SHA-1 hash of the code-signing certificate (in your login
+                keychain) used to sign the copies of your apps.  Signing with a
+                fixed certificate is what keeps privacy grants such as Full Disk
+                Access across app updates.
+              '';
+            };
+            targets.darwin.mac-app-util.createSigningIdentity = mkOption {
+              type = types.bool;
+              default = true;
+              example = false;
+              description = ''
+                Whether to create a self-signed certificate named
+                `signingIdentity` in your login keychain during activation, if it
+                does not exist yet and there are apps to sign.  macOS asks for
+                your password once, to trust the new certificate.  Disable this to
+                manage the certificate yourself (e.g. with `mac-app-util
+                create-cert`).
+              '';
+            };
           };
-          config = lib.mkIf config.targets.darwin.mac-app-util.enable {
+          config = lib.mkIf cfg.enable {
             home.activation = {
               trampolineApps =
                 let
@@ -65,6 +92,8 @@
                 lib.hm.dag.entryAfter [ "writeBoundary" ] ''
                   fromDir="$HOME/Applications/Home Manager Apps"
                   toDir="$HOME/Applications/Home Manager Trampolines"
+                  export MAC_APP_UTIL_SIGN_IDENTITY=${lib.escapeShellArg cfg.signingIdentity}
+                  ${lib.optionalString cfg.createSigningIdentity "export MAC_APP_UTIL_CREATE_CERT=1"}
                   ${mac-app-util}/bin/mac-app-util sync-trampolines "$fromDir" "$toDir"
                 '';
             };
@@ -77,6 +106,9 @@
           lib,
           ...
         }:
+        let
+          cfg = config.services.mac-app-util;
+        in
         {
           options = {
             # Technically this isn’t a “service” but this seems like the most
@@ -86,13 +118,38 @@
               default = true;
               example = false;
             };
+            services.mac-app-util.signingIdentity = lib.mkOption {
+              type = lib.types.str;
+              default = "mac-app-util system signing";
+              example = "My Code Signing Certificate";
+              description = ''
+                Name or SHA-1 hash of the code-signing certificate used to sign
+                the copies of your apps.  Activation scripts run as root, so it
+                must be in the System keychain.
+              '';
+            };
+            services.mac-app-util.createSigningIdentity = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              example = false;
+              description = ''
+                Whether to create a self-signed certificate named
+                `signingIdentity` in the System keychain during activation, if it
+                does not exist yet and there are apps to sign.  macOS asks for an
+                administrator password once, to trust the new certificate.
+                Disable this to manage the certificate yourself (e.g. with `sudo
+                mac-app-util create-cert`).
+              '';
+            };
           };
-          config = lib.mkIf config.services.mac-app-util.enable {
+          config = lib.mkIf cfg.enable {
             system.activationScripts.postActivation.text =
               let
                 mac-app-util = self.packages.${pkgs.stdenv.system}.default;
               in
               ''
+                export MAC_APP_UTIL_SIGN_IDENTITY=${lib.escapeShellArg cfg.signingIdentity}
+                ${lib.optionalString cfg.createSigningIdentity "export MAC_APP_UTIL_CREATE_CERT=1"}
                 ${mac-app-util}/bin/mac-app-util sync-trampolines "/Applications/Nix Apps" "/Applications/Nix Trampolines"
               '';
           };
@@ -121,8 +178,6 @@
                 lispPackagesLite,
                 dockutil,
                 openssl,
-                findutils,
-                jq,
                 rsync,
               }:
               with lispPackagesLite;
@@ -132,8 +187,6 @@
                 dependencies = [
                   alexandria
                   inferior-shell
-                  cl-interpol
-                  cl-json
                   str
                   trivia
                 ];
@@ -146,8 +199,6 @@
                         dockutil
                         openssl
                         rsync
-                        findutils
-                        jq
                       ]
                     }"
                 '';

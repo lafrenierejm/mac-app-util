@@ -20,8 +20,6 @@
 (require "uiop")
 
 (asdf:load-system "alexandria")
-(asdf:load-system "cl-interpol")
-(asdf:load-system "cl-json")
 (asdf:load-system "inferior-shell")
 (asdf:load-system "str")
 (asdf:load-system "trivia")
@@ -32,31 +30,6 @@
                     (#:sh #:inferior-shell)))
 
 (in-package #:script)
-
-(named-readtables:in-readtable :interpol-syntax)
-
-(defparameter *plutil* "/usr/bin/plutil")
-
-(defparameter *copyable-app-props*
-  '("CFBundleDevelopmentRegion"
-    "CFBundleDocumentTypes"
-    "CFBundleGetInfoString"
-    "CFBundleIconFile"
-    "CFBundleIdentifier"
-    "CFBundleInfoDictionaryVersion"
-    "CFBundleName"
-    "CFBundleShortVersionString"
-    "CFBundleURLTypes"
-    "NSAppleEventsUsageDescription"
-    "NSAppleScriptEnabled"
-    "NSDesktopFolderUsageDescription"
-    "NSDocumentsFolderUsageDescription"
-    "NSDownloadsFolderUsageDescription"
-    "NSPrincipalClass"
-    "NSRemovableVolumesUsageDescription"
-    "NSServices"
-    "UTExportedTypeDeclarations")
-  "Based on a hunch, nothing scientific.")
 
 (defun non-empty-env-p (name)
   (str:non-empty-string-p (uiop:getenv name)))
@@ -103,100 +76,7 @@ Checks the real uid: $USER is not reliably set in activation scripts."
                (unwind-protect (,f)
                  (rm-rf ,dir))))))))
 
-(defun list-of-strings-p (l)
-  (and (consp l) (every #'stringp l)))
 
-(deftype list-of-strings ()
-  `(satisfies list-of-strings-p))
-
-
-;;; mktrampoline
-
-(defun copy-file (from to)
-  (if *dry-run*
-      (format T "cp ~A ~A~%" from to)
-      (uiop:copy-file from to)))
-
-(defun copy-paths (from to paths)
-  (declare (type list-of-strings paths))
-  (let ((keys (cl-json:encode-json-to-string *copyable-app-props*))
-        ;; For an object, keep only those keys from list “keys”
-        (jqfilter "to_entries |[.[]| select(.key as $item| $keys | index($item) >= 0) ] | from_entries"))
-    (in-temp-dir
-      (copy-file from "orig")
-      (copy-file to "bare-wrapper")
-      (sh `(sh:and (,*plutil* -convert json -- orig)
-                   (,*plutil* -convert json -- bare-wrapper)
-                   (jq :argjson keys ,keys ,jqfilter (< orig) (> filtered))
-                   (sh:pipe (cat bare-wrapper filtered)
-                            (jq #\s add (> final)))
-                   (,*plutil* -convert xml1 -- final)))
-      (copy-file "final" to))))
-
-(defun resources (app)
-  #?"${app}/Contents/Resources/")
-
-(defun infoplist (app)
-  #?"${app}/Contents/Info.plist")
-
-(defun app-p (path)
-  "Is this path a .app bundle?"
-  (probe-file (infoplist path)))
-
-(defun sync-icons (from to)
-  "Remove all icons from TO apps resources, and copy all icons FROM to it"
-  (destructuring-bind (from-cnts to-cnts) (mapcar #'resources (list from to))
-    (when (probe-file from-cnts)
-      ;; 🤷
-      (sh `(sh:and
-            (find ,to-cnts -name "*.icns" -delete)
-            (rsync :include "*.icns"
-                   :exclude "*"
-                   :recursive
-                   ;; For icon files which are symlinks
-                   :links
-                   ,from-cnts ,to-cnts))))))
-
-(defun mktrampoline-app (app trampoline)
-  (let ((cmd (format NIL "do shell script \"open '~A'\"" app)))
-    (sh `("/usr/bin/osacompile" #\o ,trampoline #\e ,cmd))
-    (sync-icons app trampoline)
-    (copy-paths (infoplist app) (infoplist trampoline) *copyable-app-props*)
-    ;; Sometimes the OS displays blank or stock applescript icons for these
-    ;; generated apps in launchpad, finder, etc.  It’s not 100% clear why and
-    ;; it’s hard to reproduce but this seems to help.  Probably a race condition
-    ;; between generating the original wrapper and updating the icons.  A
-    ;; cleaner solution would be building the app bundle in a temporary
-    ;; directory and only copying it in when fully ready, but this works for
-    ;; now.
-    (sh `(touch ,trampoline))))
-
-(defun mktrampoline-bin (bin trampoline)
-  ;; In order for applescript not to wait on the binary you must direct both
-  ;; output pipes to null.
-  (let ((cmd (format NIL "do shell script \"'~A' &> /dev/null &\"" bin)))
-    (sh `("/usr/bin/osacompile" #\o ,trampoline #\e ,cmd))))
-
-(defgeneric mktrampoline (from to))
-
-(defmethod mktrampoline ((from string) (to string))
-  (let ((from-abs (probe-file from)))
-    (when (null from-abs)
-      (error "No such file: ~A" from))
-    (mktrampoline from-abs (uiop:ensure-pathname to
-                                                 :ensure-absolute t
-                                                 :defaults (uiop:getcwd)))))
-
-(defmethod mktrampoline ((from pathname) (to pathname))
-  (uiop:ensure-pathname from :ensure-absolute t)
-  (uiop:ensure-pathname to :ensure-absolute t)
-  (if (uiop:directory-pathname-p from)
-      (if (app-p from)
-          (mktrampoline-app from to)
-          (error "Path ~A does not appear to be a Mac app (missing Info.plist)" from))
-      (mktrampoline-bin from to)))
-
-
 ;;; sync-dock
 
 (defun realpath (f)
@@ -302,6 +182,11 @@ Signing by hash avoids codesign's loose matching of names."
            (error "Several code-signing identities are named ~S: ~{~A~^, ~}.  Remove the extra ones, or use a hash as the identity." identity hashes))
           (T (first hashes)))))
 
+(defun env-identity ()
+  "The signing identity named in $MAC_APP_UTIL_SIGN_IDENTITY, or the default."
+  (let ((id (uiop:getenv "MAC_APP_UTIL_SIGN_IDENTITY")))
+    (if (str:non-empty-string-p id) id (default-cert-name))))
+
 (defun create-cert (&optional (name (default-cert-name)))
   "Create a self-signed code-signing certificate and install it in the keychain.
 
@@ -390,37 +275,51 @@ APP and TO must be directory pathnames."
           ;; directory further, e.g. KDE apps in /Applications/Nix
           ;; Apps/KDE/Foo.app.  There are many ways to deal with this, but
           ;; honestly just hard-coding one extra level of search is probably the
-          ;; easiest.  This nexting won’t survive in the trampoline directory,
+          ;; easiest.  This nesting won’t survive in the destination directory,
           ;; but that doesn’t seem to matter.
           '(#p "*.app" #p "*/*.app")))
 
 (defun sync-trampolines (&rest args)
+  "Replace TO with a signed copy of every app in FROM; update the dock.
+
+Signs with the identity named in $MAC_APP_UTIL_SIGN_IDENTITY, or the default
+one.  With $MAC_APP_UTIL_CREATE_CERT set, a missing identity is created first.
+
+The name is historical: nothing is a trampoline anymore, see sign-copy."
   (destructuring-bind (from to) (mapcar #'to-abs-dir args)
     (rm-rf to)
-    ;; Since 25.11 nix-darwin copies .app folders directly to /Applications.  In
-    ;; that scenario, trampolines only get in the way.
+    ;; Since 25.11 nix-darwin copies .app folders directly to /Applications.
+    ;; In that scenario there is nothing to do here.
     ;; https://github.com/nix-darwin/nix-darwin/pull/1396
     (when (symlinked-dir-p from)
       (ensure-directories-exist to)
-      (let ((apps (gather-apps from)))
-        (dolist (app apps)
-          (mktrampoline app (merge-pathnames (directory-name app) to)))
-        (sync-dock apps)))))
+      (alex:when-let ((apps (gather-apps from)))
+        ;; Only touch the keychain when there is something to sign, so that a
+        ;; setup without apps never asks for a password.
+        (let ((name (env-identity)))
+          (when (and (non-empty-env-p "MAC_APP_UTIL_CREATE_CERT")
+                     (null (find-identities name)))
+            (create-cert name))
+          (let ((identity (if (and *dry-run* (null (find-identities name)))
+                              name
+                              (resolve-identity name))))
+            (sync-dock
+             (mapcar (lambda (app)
+                       (let ((dest (to-abs-dir (merge-pathnames (directory-name app) to))))
+                         (sign-copy app dest identity)
+                         dest))
+                     apps))))))))
 
-
+
 ;;; CLI
 
 (defun print-usage ()
   (format T "Usage:
 
-    mac-app-util mktrampoline FROM.app TO.app
     mac-app-util sync-dock Foo.app Bar.app ...
     mac-app-util sync-trampolines /my/nix/Applications /Applications/MyTrampolines/
     mac-app-util sign-copy FROM.app TO.app IDENTITY
     mac-app-util create-cert [NAME]
-
-mktrampline creates a “trampoline” application launcher that immediately
-launches another application.
 
 sync-dock updates persistent items in your dock if any of the given apps has the
 same name. This can be used to programmatically keep pinned items in your dock
@@ -435,8 +334,12 @@ Trusting the certificate asks for a password.
 sign-copy copies an app and signs the copy with the given code-signing identity.
 
 sync-trampolines is an all-in-1 solution that syncs an entire directory of *.app
-files to another by creating a trampoline launcher for every app, deleting the
-rest, and updating the dock.
+files to another by copying every app and signing it, deleting the rest, and
+updating the dock.  It signs with the identity named in
+$MAC_APP_UTIL_SIGN_IDENTITY, or the create-cert default.  If
+$MAC_APP_UTIL_CREATE_CERT is set, a missing identity is created first.  A fixed
+signing identity keeps privacy grants (Full Disk Access etc.) across app
+updates.
 "))
 
 (defun main ()
@@ -446,8 +349,6 @@ rest, and updating the dock.
           (print-usage)
           (uiop:quit 0))
         (trivia:match args
-          ((list "mktrampoline" from to)
-           (mktrampoline from to))
           ((list* "sync-dock" apps)
            (sync-dock apps))
           ((list "sync-trampolines" from to)

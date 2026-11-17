@@ -4,16 +4,41 @@ This is a [[https://nixos.org][Nix]] module for Macintosh computers (“darwin�
 
 - Launching .app programs from Spotlight
 - Pinning a .app in the Dock, even across Nix updates
+- Keeping privacy permissions (e.g. Full Disk Access) granted to an app across Nix updates
 
 Now you can launch Nix-installed apps using only your keyboard, using @@html:<kbd>@@⌘ space@@html:</kbd>@@.
-
-You can also use it to create .app wrappers for non-.app programs, aka stand-alone binary programs, aka non-bundle programs.
 
 ** How to use
 
 It works in [[https://github.com/nix-community/home-manager][home-manager]] and [[https://github.com/LnL7/nix-darwin][nix-darwin]] by providing a module for both.  You just need to load the module, nothing else, and it will automatically run every time you =switch= your config.
 
 Home-manager and nix-darwin aren’t either-or: you can have both, and you can install .app bundles on your mac through both (some user specific using home-manager, some system wide using nix-darwin).  In that case you’d want to load both the nix-darwin module, and the home-manager module at the same time in their respective configurations.
+
+*** The signing certificate
+
+mac-app-util installs a /signed copy/ of each of your apps, so that macOS keeps recognizing them (and the permissions you gave them) after an update. See [[*Why copies, and why a certificate][below]] for why. That needs a code-signing certificate, and the modules set one up for you:
+
+- The first time you =switch= with apps to install, the module creates a self-signed certificate: =mac-app-util user signing= in your login keychain (home-manager), or =mac-app-util system signing= in the System keychain (nix-darwin).
+- macOS asks for your password once, to trust it. Run that first =switch= at your Mac, not over SSH: without someone to answer the prompt, the activation can't complete.
+- After that it is reused, and activation is unattended. It is never created if there are no apps to sign.
+
+Nothing needs configuring. To use a certificate of your own, set =signingIdentity= to its name or hash, and turn off automatic creation:
+
+#+begin_src nix
+# home-manager
+targets.darwin.mac-app-util = {
+  signingIdentity = "My Code Signing Certificate";
+  createSigningIdentity = false;
+};
+
+# nix-darwin (the certificate must be in the System keychain)
+services.mac-app-util = {
+  signingIdentity = "My Code Signing Certificate";
+  createSigningIdentity = false;
+};
+#+end_src
+
+See [[*create-cert][=create-cert=]] to create one by hand.
 
 *** Flakes, just home-manager
 
@@ -164,31 +189,10 @@ in
 
 At the core of this project is a (Nix-agnostic) program that can:
 
-- =mktrampoline= :: Create a “trampoline” launcher app
 - =sync-dock= :: Update persistent apps in the Dock
-- =sync-trampolines= :: Create a directory with trampolines to all your apps
-
-** mktrampoline
-
-This creates a “trampoline” launcher app which is a simple wrapper application that just launches your actual application.
-
-#+begin_src shell
-$ nix run github:hraban/mac-app-util -- mktrampoline /path/to/MyApp.app /Applications/MyApp.app
-#+end_src
-
-Intuitively, you would either fully copy & paste the original .app, or create a symlink or “alias”; all of those solutions have different problems and they don’t get indexed by Spotlight properly.
-
-This trampoline script is indexed by Spotlight and by Launchpad, so you can keep launching your apps using =⌘ SPC <appname> ⏎=
-
-You can also wrap non-app stand-alone binaries with this. For example:
-
-#+begin_src shell
-$ nix run github:hraban/mac-app-util -- mktrampoline "$(which darktable)" ~/Applications/Darktable.app
-#+end_src
-
-Darktable is a photo editor available on Mac but without a .app bundle in the derivation. It’s just a stand-alone binary. Using mktrampoline, you can make it launchable from Spotlight.
-
-See https://github.com/nix-community/home-manager/issues/1341
+- =create-cert= :: Create a self-signed code-signing certificate
+- =sign-copy= :: Copy an app and sign the copy with a code-signing certificate
+- =sync-trampolines= :: Create a directory with signed copies of all your apps (this is what the modules run)
 
 ** sync-dock
 
@@ -202,17 +206,68 @@ It will find an old persistent item by the name of "Foo" and update it to the ne
 
 N.B.: This is currently limited only to Nix apps, but actually it could work for anything. I’ve just kept it conservative to be on the safe side.
 
+** create-cert
+
+Creates a self-signed code-signing certificate. The modules do this for you (see [[*The signing certificate][The signing certificate]]); run it by hand if you turned that off, or to set things up ahead of time:
+
+#+begin_src shell
+$ nix run github:hraban/mac-app-util -- create-cert            # in your login keychain
+$ sudo nix run github:hraban/mac-app-util -- create-cert       # as root: in the System keychain, for nix-darwin
+$ nix run github:hraban/mac-app-util -- create-cert "My Cert"  # or pick a name
+#+end_src
+
+The default name is =mac-app-util user signing=, or =mac-app-util system signing= when run as root, matching the modules' defaults. The two names differ on purpose: users can see the System keychain too, and with a shared name a user could pick up the system certificate, whose private key they cannot use.
+
+It generates a key and certificate with =openssl=, imports them into the keychain, and trusts the certificate for code signing. Trusting it asks for a password. It does nothing if an identity with that name already exists. The private key only lives in a temporary directory and the keychain, never in the Nix store.
+
+The first time =codesign= uses the key, macOS may ask for permission; choose "Always Allow". To avoid that prompt, run once, as the command's output also says:
+
+#+begin_src shell
+$ security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~/Library/Keychains/login.keychain-db
+#+end_src
+
+Identities are matched by their exact name, or by their SHA-1 hash, and apps are signed by hash. If several certificates have the same name, signing fails and asks you to remove the extras; see them with =security find-identity -p codesigning=, and delete one with =security delete-identity -Z <hash>=.
+
+You can also create the certificate by hand: Keychain Access → Certificate Assistant → Create a Certificate…, with /Certificate Type/ set to /Code Signing/.
+
+** sign-copy
+
+#+begin_src shell
+$ nix run github:hraban/mac-app-util -- sign-copy /path/to/MyApp.app /Applications/MyApp.app "My Signing Certificate"
+#+end_src
+
+Copies the app bundle and signs the copy with the named code-signing identity.
+
 ** sync-trampolines
 
-Combines =mktrampoline= and =sync-dock= to create a fresh directory with a fresh trampoline for every source app. E.g.:
+Combines =sign-copy= and =sync-dock= to create a fresh directory with a signed copy of every source app. E.g.:
 
 #+begin_src shell
 $ nix run github:hraban/mac-app-util -- sync-trampolines ~/special/apps/ ~/Applications/Special/
 #+end_src
 
-Will create a fresh directory (=~/Applications/Special=), deleting if it already existed. In that directory it will create a trampoline app for every single =*.app= file it finds in =~/special/apps/=.
+Will create a fresh directory (=~/Applications/Special=), deleting if it already existed. In that directory it will put a signed copy of every single =*.app= file it finds in =~/special/apps/=.
+
+It signs with the certificate named in =MAC_APP_UTIL_SIGN_IDENTITY=, or with the [[*create-cert][=create-cert=]] default if that is unset. If the certificate is missing it fails, pointing to =create-cert=; with =MAC_APP_UTIL_CREATE_CERT=1= it creates the certificate instead, as the modules do. Either way it only touches the keychain when there are apps to sign.
 
 This helps register apps from outside of your =~/Applications= directory with Spotlight and the Launchpad.
+
+The name is historical: the apps are real copies, not trampolines.
+
+The modules run it for you on every activation: home-manager copies =~/Applications/Home Manager Apps= to =~/Applications/Home Manager Trampolines=, and nix-darwin copies =/Applications/Nix Apps= to =/Applications/Nix Trampolines=. (The directory names are historical too.)
+
+*** Why copies, and why a certificate
+
+Privacy permissions such as Full Disk Access are granted to the app that actually runs, and macOS identifies it by its code signature. Apps built by Nix are only ad-hoc signed, so their identity is a hash of the code that changes with every build. After each update macOS no longer recognizes the app and drops the grant. A launcher app in front of the real app cannot help: the grant belongs to the launched app, not the launcher.
+
+Signing the copy with a fixed certificate makes its identity "this bundle ID, signed by this certificate", which stays the same across updates. You grant Full Disk Access once to the copy, and it persists.
+
+*** Caveats
+
+- The copy is signed anew, so the original signature (and with it any notarization) is gone. Entitlements, flags and runtime options are preserved.
+- Symlinks that point outside the app bundle (common with Nix) are replaced by copies of their targets, so the copies take more disk space.
+- Every run replaces the copies; the Dock is pointed at them.
+- Apple's own apps cannot be signed this way: a signed copy of TextEdit fails to launch ("Launchd job spawn failed"), most likely because Apple's apps carry entitlements that only Apple's signature is allowed to have. This doesn't affect apps installed through Nix, and there is no reason to copy Apple's apps anyway, but keep it in mind if you point =sign-copy= at one.
 
 * License
 
