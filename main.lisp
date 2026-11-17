@@ -66,8 +66,10 @@
 (defparameter *dry-run* (non-empty-env-p "DRY_RUN"))
 
 (defun rootp ()
-  "Am I the root user?"
-  (equal "root" (uiop:getenv "USER")))
+  "Am I the root user?
+
+Checks the real uid: $USER is not reliably set in activation scripts."
+  (equal "0" (uiop:run-program '("/usr/bin/id" "-u") :output '(:string :stripped t))))
 
 (defun sh (&rest args)
   (if *dry-run*
