@@ -269,6 +269,16 @@ Signing the copy with a fixed certificate makes its identity "this bundle ID, si
 - Every run replaces the copies; the Dock is pointed at them.
 - Apple's own apps cannot be signed this way: a signed copy of TextEdit fails to launch ("Launchd job spawn failed"), most likely because Apple's apps carry entitlements that only Apple's signature is allowed to have. This doesn't affect apps installed through Nix, and there is no reason to copy Apple's apps anyway, but keep it in mind if you point =sign-copy= at one.
 
+** Testing
+
+=tests/e2e-fda.sh= is an end-to-end test of the main feature: that a Full Disk Access grant survives an app update. Run it by hand on a Mac, from a terminal, in a checkout of this repo:
+
+#+begin_src shell
+$ ./tests/e2e-fda.sh
+#+end_src
+
+It builds two versions of a tiny test app (=nix build .#test-app=, and =.#test-app-v2= standing in for an update), installs v1 as a signed copy with =sync-trampolines=, and checks it is denied access. You then grant Full Disk Access to the copy in System Settings (the one manual step; macOS does not allow scripting it), and the script checks that access works, replaces v1 with v2, and checks that access still works without a new grant. The test app's permission entry is reset at the start and end, and everything else lives in a temporary directory.
+
 * License
 
 mac-app-util - Manage Mac App launchers

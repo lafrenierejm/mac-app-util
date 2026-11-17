@@ -209,6 +209,9 @@
                 meta.license = pkgs.lib.licenses.agpl3Only;
               }
             ) { };
+            # For testing; see tests/e2e-fda.sh.  v2 simulates an update of v1.
+            test-app = pkgs.callPackage ./test-app.nix { version = "1"; };
+            test-app-v2 = pkgs.callPackage ./test-app.nix { version = "2"; };
           };
           formatter = treefmtPkg.config.build.wrapper;
         }
