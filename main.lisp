@@ -342,6 +342,27 @@ The first time codesign uses the key macOS may ask for permission; choose
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~A~%"
                 name keychain keychain))))
 
+(defun sign-copy (app to identity)
+  "Copy the app bundle APP to TO and sign the copy with IDENTITY.
+
+Nix apps are ad-hoc signed, so their designated requirement is a code hash that
+changes with every build, and macOS drops privacy grants such as Full Disk
+Access whenever the app is updated.  Signing with a fixed certificate makes the
+requirement \"this bundle ID, signed by this certificate\", which survives
+updates.
+
+APP and TO must be directory pathnames."
+  (let ((src (uiop:native-namestring app))
+        (dst (uiop:native-namestring to)))
+    (sh `(mkdir -p ,dst))
+    ;; Store files are read-only; the copy must be writable to be signed.
+    ;; Symlinks pointing outside the bundle (typical for Nix) are replaced by
+    ;; their targets, otherwise codesign rejects the bundle.
+    (sh `(rsync :archive :copy-unsafe-links :chmod "u+w" ,src ,dst))
+    (sh `("/usr/bin/codesign" "--force" "--deep" "--sign" ,identity
+          "--preserve-metadata=identifier,entitlements,flags,runtime"
+          ,(string-right-trim "/" dst)))))
+
 
 ;;; sync-trampolines
 
@@ -395,6 +416,7 @@ The first time codesign uses the key macOS may ask for permission; choose
     mac-app-util mktrampoline FROM.app TO.app
     mac-app-util sync-dock Foo.app Bar.app ...
     mac-app-util sync-trampolines /my/nix/Applications /Applications/MyTrampolines/
+    mac-app-util sign-copy FROM.app TO.app IDENTITY
     mac-app-util create-cert [NAME]
 
 mktrampline creates a “trampoline” application launcher that immediately
@@ -409,6 +431,8 @@ create-cert creates a self-signed code-signing certificate and installs it in th
 keychain: your login keychain, or the System keychain when run as root.  Default
 name: \"mac-app-util user signing\", or \"mac-app-util system signing\" as root.
 Trusting the certificate asks for a password.
+
+sign-copy copies an app and signs the copy with the given code-signing identity.
 
 sync-trampolines is an all-in-1 solution that syncs an entire directory of *.app
 files to another by creating a trampoline launcher for every app, deleting the
@@ -432,6 +456,8 @@ rest, and updating the dock.
            (create-cert))
           ((list "create-cert" name)
            (create-cert name))
+          ((list "sign-copy" from to identity)
+           (sign-copy (to-abs-dir from) (to-abs-dir to) (resolve-identity identity)))
           (_
            (print-usage)
            (uiop:quit 1))))))
