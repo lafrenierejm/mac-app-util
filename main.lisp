@@ -227,8 +227,62 @@ The first time codesign uses the key macOS may ask for permission; choose
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~A~%"
                 name keychain keychain))))
 
-(defun sign-copy (app to identity)
+(defparameter *plist-buddy* "/usr/libexec/PlistBuddy")
+
+(defun plist-set (plist key value)
+  "Set the string KEY in the Info.plist PLIST, adding it if it is missing."
+  (flet ((pb (command)
+           (list *plist-buddy* "-c" command plist)))
+    (let ((set (pb (format NIL "Set :~A \"~A\"" key value)))
+          (add (pb (format NIL "Add :~A string \"~A\"" key value))))
+      (if *dry-run*
+          (sh set)
+          (unless (zerop (nth-value 2 (uiop:run-program set :output NIL :error-output NIL
+                                                            :ignore-error-status T)))
+            (sh add))))))
+
+(defun icons-dir-icon (app)
+  "The icon directory configured for APP in $MAC_APP_UTIL_ICONS_DIR, if any.
+
+That directory holds one subdirectory (or symlink to one) per app, named like
+the app without \".app\": Emacs for Emacs.app."
+  (let ((root (uiop:getenv "MAC_APP_UTIL_ICONS_DIR")))
+    (when (str:non-empty-string-p root)
+      (uiop:directory-exists-p
+       (merge-pathnames
+        (uiop:ensure-directory-pathname (pathname-name (path-without-slash app)))
+        (uiop:ensure-directory-pathname (uiop:parse-native-namestring root)))))))
+
+(defun apply-icon (dst icon)
+  "Give the app bundle at the native path DST the icon in the directory ICON.
+
+ICON must hold one *.icns file, and may hold a compiled Assets.car with the
+Liquid Glass icon (macOS 26+), whose icon name must be that of the .icns file.
+An app's own Assets.car is never replaced, since it holds more than the icon;
+then only the .icns is used."
+  (let* ((icns (directory (merge-pathnames #p"*.icns" (uiop:ensure-directory-pathname icon))))
+         (car-file (uiop:file-exists-p (merge-pathnames #p"Assets.car" (uiop:ensure-directory-pathname icon))))
+         (resources (format NIL "~A/Contents/Resources/" (string-right-trim "/" dst)))
+         (plist (format NIL "~A/Contents/Info.plist" (string-right-trim "/" dst))))
+    (unless (= 1 (length icns))
+      (error "Icon directory ~A must contain exactly one .icns file, found ~D." icon (length icns)))
+    (let ((name (pathname-name (first icns))))
+      (sh `(mkdir -p ,resources))
+      (sh `(cp -f ,(uiop:native-namestring (first icns)) ,resources))
+      (plist-set plist "CFBundleIconFile" name)
+      (when car-file
+        (if (uiop:file-exists-p (format NIL "~AAssets.car" resources))
+            (format *error-output* "Warning: not replacing the existing Assets.car in ~A; using only the .icns.~%" dst)
+            (progn
+              (sh `(cp -f ,(uiop:native-namestring car-file) ,resources))
+              (plist-set plist "CFBundleIconName" name))))
+      ;; The copy is made writable by rsync, but keep it tidy for codesign.
+      (sh `("chmod" "-R" "u+w" ,resources)))))
+
+(defun sign-copy (app to identity &optional icon)
   "Copy the app bundle APP to TO and sign the copy with IDENTITY.
+
+With ICON, a directory pathname, the copy gets that icon first; see apply-icon.
 
 Nix apps are ad-hoc signed, so their designated requirement is a code hash that
 changes with every build, and macOS drops privacy grants such as Full Disk
@@ -244,6 +298,9 @@ APP and TO must be directory pathnames."
     ;; Symlinks pointing outside the bundle (typical for Nix) are replaced by
     ;; their targets, otherwise codesign rejects the bundle.
     (sh `(rsync :archive :copy-unsafe-links :chmod "u+w" ,src ,dst))
+    ;; Must happen before signing: the icon is part of the signed bundle.
+    (when icon
+      (apply-icon dst icon))
     (sh `("/usr/bin/codesign" "--force" "--deep" "--sign" ,identity
           "--preserve-metadata=identifier,entitlements,flags,runtime"
           ,(string-right-trim "/" dst)))))
@@ -284,6 +341,7 @@ APP and TO must be directory pathnames."
 
 Signs with the identity named in $MAC_APP_UTIL_SIGN_IDENTITY, or the default
 one.  With $MAC_APP_UTIL_CREATE_CERT set, a missing identity is created first.
+Apps with a subdirectory in $MAC_APP_UTIL_ICONS_DIR get that icon.
 
 The name is historical: nothing is a trampoline anymore, see sign-copy."
   (destructuring-bind (from to) (mapcar #'to-abs-dir args)
@@ -306,7 +364,7 @@ The name is historical: nothing is a trampoline anymore, see sign-copy."
             (sync-dock
              (mapcar (lambda (app)
                        (let ((dest (to-abs-dir (merge-pathnames (directory-name app) to))))
-                         (sign-copy app dest identity)
+                         (sign-copy app dest identity (icons-dir-icon app))
                          dest))
                      apps))))))))
 
@@ -318,7 +376,7 @@ The name is historical: nothing is a trampoline anymore, see sign-copy."
 
     mac-app-util sync-dock Foo.app Bar.app ...
     mac-app-util sync-trampolines /my/nix/Applications /Applications/MyTrampolines/
-    mac-app-util sign-copy FROM.app TO.app IDENTITY
+    mac-app-util sign-copy FROM.app TO.app IDENTITY [ICON-DIR]
     mac-app-util create-cert [NAME]
 
 sync-dock updates persistent items in your dock if any of the given apps has the
@@ -332,10 +390,13 @@ name: \"mac-app-util user signing\", or \"mac-app-util system signing\" as root.
 Trusting the certificate asks for a password.
 
 sign-copy copies an app and signs the copy with the given code-signing identity.
+With ICON-DIR, a directory with one .icns file (and optionally a compiled
+Assets.car with the same icon name), the copy gets that icon.
 
 sync-trampolines is an all-in-1 solution that syncs an entire directory of *.app
 files to another by copying every app and signing it, deleting the rest, and
-updating the dock.  It signs with the identity named in
+updating the dock.  If $MAC_APP_UTIL_ICONS_DIR is set, every app Foo.app with a
+subdirectory Foo in it gets the icon in that directory (see sign-copy).  It signs with the identity named in
 $MAC_APP_UTIL_SIGN_IDENTITY, or the create-cert default.  If
 $MAC_APP_UTIL_CREATE_CERT is set, a missing identity is created first.  A fixed
 signing identity keeps privacy grants (Full Disk Access etc.) across app
@@ -359,6 +420,9 @@ updates.
            (create-cert name))
           ((list "sign-copy" from to identity)
            (sign-copy (to-abs-dir from) (to-abs-dir to) (resolve-identity identity)))
+          ((list "sign-copy" from to identity icon)
+           (sign-copy (to-abs-dir from) (to-abs-dir to) (resolve-identity identity)
+                      (to-abs-dir icon)))
           (_
            (print-usage)
            (uiop:quit 1))))))

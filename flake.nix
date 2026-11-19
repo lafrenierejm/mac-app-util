@@ -82,17 +82,33 @@
                 create-cert`).
               '';
             };
+            targets.darwin.mac-app-util.icons = lib.mkOption {
+              type = lib.types.attrsOf lib.types.path;
+              default = { };
+              example = lib.literalExpression "{ Emacs = ./Resources; }";
+              description = ''
+                Custom icons for your apps, by app name (`Emacs` for `Emacs.app`).  Each
+                value is a directory with one `.icns` file and, optionally, a compiled
+                `Assets.car` with the Liquid Glass icon (macOS 26 and later) whose icon
+                name is that of the `.icns` file.  The icon is applied to the signed
+                copy of the app.  An app's own `Assets.car` is never replaced.
+              '';
+            };
           };
           config = lib.mkIf cfg.enable {
             home.activation = {
               trampolineApps =
                 let
                   mac-app-util = self.packages.${pkgs.stdenv.system}.default;
+                  iconsDir = pkgs.linkFarm "mac-app-util-icons" (
+                    lib.mapAttrsToList (name: path: { inherit name path; }) cfg.icons
+                  );
                 in
                 lib.hm.dag.entryAfter [ "writeBoundary" ] ''
                   fromDir="$HOME/Applications/Home Manager Apps"
                   toDir="$HOME/Applications/Home Manager Trampolines"
                   export MAC_APP_UTIL_SIGN_IDENTITY=${lib.escapeShellArg cfg.signingIdentity}
+                  ${lib.optionalString (cfg.icons != { }) "export MAC_APP_UTIL_ICONS_DIR=${iconsDir}"}
                   ${lib.optionalString cfg.createSigningIdentity "export MAC_APP_UTIL_CREATE_CERT=1"}
                   ${mac-app-util}/bin/mac-app-util sync-trampolines "$fromDir" "$toDir"
                 '';
@@ -141,14 +157,30 @@
                 mac-app-util create-cert`).
               '';
             };
+            services.mac-app-util.icons = lib.mkOption {
+              type = lib.types.attrsOf lib.types.path;
+              default = { };
+              example = lib.literalExpression "{ Emacs = ./Resources; }";
+              description = ''
+                Custom icons for your apps, by app name (`Emacs` for `Emacs.app`).  Each
+                value is a directory with one `.icns` file and, optionally, a compiled
+                `Assets.car` with the Liquid Glass icon (macOS 26 and later) whose icon
+                name is that of the `.icns` file.  The icon is applied to the signed
+                copy of the app.  An app's own `Assets.car` is never replaced.
+              '';
+            };
           };
           config = lib.mkIf cfg.enable {
             system.activationScripts.postActivation.text =
               let
                 mac-app-util = self.packages.${pkgs.stdenv.system}.default;
+                iconsDir = pkgs.linkFarm "mac-app-util-icons" (
+                  lib.mapAttrsToList (name: path: { inherit name path; }) cfg.icons
+                );
               in
               ''
                 export MAC_APP_UTIL_SIGN_IDENTITY=${lib.escapeShellArg cfg.signingIdentity}
+                ${lib.optionalString (cfg.icons != { }) "export MAC_APP_UTIL_ICONS_DIR=${iconsDir}"}
                 ${lib.optionalString cfg.createSigningIdentity "export MAC_APP_UTIL_CREATE_CERT=1"}
                 ${mac-app-util}/bin/mac-app-util sync-trampolines "/Applications/Nix Apps" "/Applications/Nix Trampolines"
               '';
